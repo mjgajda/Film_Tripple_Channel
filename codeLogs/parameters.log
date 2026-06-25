@@ -1,0 +1,7 @@
+DEBUG    Loading parameters JSON: /home/michaelgajda/cal_Lab_Work/alanine_main_branch/parameterv2.json
+DEBUG    Parameters JSON is a list (3 records)
+DEBUG      angle 120°: slope=19158.2 intercept=-0.324782 r2=0.999857 loo_rmse_gy=0.378987
+DEBUG      angle   0°: slope=19441 intercept=-0.335774 r2=0.998596 loo_rmse_gy=1.21508
+DEBUG      angle 240°: slope=19140 intercept=-0.04479 r2=0.997958 loo_rmse_gy=1.45413
+INFO     Loaded 3 parameter angle(s) from /home/michaelgajda/cal_Lab_Work/alanine_main_branch/parameterv2.json
+DEBUG    Template masses: {'left': 60.001, 'right': 59.949, 'center': 60.402}
