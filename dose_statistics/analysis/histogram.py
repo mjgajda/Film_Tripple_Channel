@@ -38,8 +38,14 @@ def BatchHistogram_OD(OD_pre, OD_post, iteration, chan, saveDirectory):
 
         
 
-        # Subtract histograms: post - pre
-        diff_OD = calibrated[1] - calibrated[0]
+        # Post - pre: pixel by pixel when the two line up, otherwise post minus
+        # the pre film's median (pre and post are separate masks of different size)
+        pre_arr = np.asarray(calibrated[0], dtype=float)
+        post_arr = np.asarray(calibrated[1], dtype=float)
+        if pre_arr.shape == post_arr.shape:
+            diff_OD = post_arr - pre_arr
+        else:
+            diff_OD = post_arr - np.nanmedian(pre_arr)
         counts, bin_edges = np.histogram(diff_OD, bins=bins, range=(-0.1, 1.1))
         hist_data.append((bin_centers, counts))
 
@@ -126,6 +132,7 @@ def plot_graph(x, y, title="", xlabel="", ylabel="", legend=None,savePath=Path('
         try:
             popt, _ = curve_fit(gaussian, x, y_series)
             a, mu, sigma = popt
+            sigma = abs(sigma)  # the fit can return either sign
             gauss_y = gaussian(x, *popt) / np.max(gaussian(x, *popt))  # Normalize for plotting
             gauss_label = f"Gaussian Fit {i+1}\nμ = {mu:.3f}, σ = {sigma:.3f}"
             plt.plot(x, gauss_y, linewidth=2, label=gauss_label)

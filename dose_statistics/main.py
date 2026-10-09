@@ -1,39 +1,154 @@
-import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
-import os
-import cv2
-import re
-from dose_statistics.Dose_calculation.correction_to_film import  calculate_od, readInRawODFromPicture
-from pathlib import Path
+"""
+Dose from the mask-filtered OD JSONs written by film_read_in_code.
+
+For each film label found in both the pre and post scans:
+  1. read the R, G, B calibrated OD (and pixel coordinates) from every
+     <name>_<c>_od.json / .npz in each scan's <stem>_tiles folder
+     (<name> = <stem>, or <stem>_set<k> when film_labels is a list of lists)
+  2. drop pixels that are NaN in any channel, so R, G, B stay aligned
+  3. unexposed OD = per-channel median of the pre film (unexp_mode='median')
+  4. multichannel + single-channel dose per pixel
+  5. write dose_od_pair_<label>.csv, film_dose_summary.csv, dose_provenance.json
+"""
+
+import glob
 import json
-from dose_statistics.analysis.histogram import BatchHistogramDose, BatchHistogram_OD
-from dose_statistics.analysis.profile import Batch2Dprofile_Dose, Batch2Dprofile_OD
-from dose_statistics.analysis.roi_analysis import BatchROIanalysis_Dose, BatchROIanalysis_OD
+import os
+
+import numpy as np
+import pandas as pd
+
+from dose_statistics.analysis.histogram import BatchHistogram_OD
 from dose_statistics.multichannel_dosimetry import dose_calculation, single_channel_dose
-from dose_statistics.Constants import constants
-from dose_statistics.gui.dialogs import ask_text, ask_float, ask_yesno, ask_open_file
-channel_map = {'r': 2, 'g': 1, 'b': 0}
+from dose_statistics.gui.dialogs import ask_yesno
+from film_read_in_code.input_output.od_json_export import load_od_json
 
-def match_array_sizes(arr1, arr2):
-    # Get the minimum size for every dimension
-    # This handles cases where one array might be 10x5 and the other 8x12
-    min_shape = tuple(min(s1, s2) for s1, s2 in zip(arr1.shape, arr2.shape))
-    
-    # Create slices for each dimension: e.g., (slice(0, 8), slice(0, 5))
-    selector = tuple(slice(0, dim) for dim in min_shape)
-    
-    # Return both arrays shrunk to the overlapping dimensions
-    return arr1[selector], arr2[selector]
+CHANNELS = ("r", "g", "b")
 
-def analyzeODs(preOD, postOD, i, chan, saveDirectory):
-    preOD_match, postOD_match = match_array_sizes(preOD, postOD)
 
-    stats_hist_OD = BatchHistogram_OD(preOD_match, postOD_match, i, chan, saveDirectory)
-    stats_prof_OD = Batch2Dprofile_OD(preOD_match, postOD_match, i, chan, saveDirectory)
+# =====================================================================
+# Reading the OD JSONs
+# =====================================================================
+def find_od_json_sets(tiles_dir: str) -> list:
+    """
+    All OD JSON sets in a scan's tiles folder: [{'r': path, 'g': path, 'b': path}, ...],
+    one per <name>_r_od.json that has matching _g_ and _b_ files.
+    """
+    sets = []
+    for r_path in sorted(glob.glob(os.path.join(tiles_dir, "*_r_od.json"))):
+        base = r_path[: -len("_r_od.json")]
+        paths = {c: f"{base}_{c}_od.json" for c in CHANNELS}
+        missing = [c for c, p in paths.items() if not os.path.exists(p)]
+        if missing:
+            print(f"[WARN] {os.path.basename(base)}: no {missing} OD JSON; set skipped.")
+            continue
+        sets.append(paths)
+    if not sets:
+        raise FileNotFoundError(
+            f"No OD JSONs (*_r_od.json) in {tiles_dir}. This scan was read in before OD JSONs "
+            f"existed; rerun the read-in for it (answer no to loading cached data)."
+        )
+    return sets
 
-    return postOD_match - preOD_match
 
+def _label_key(label):
+    """JSON labels come back as int/str; keep them hashable and comparable."""
+    if isinstance(label, (int, np.integer)):
+        return int(label)
+    if isinstance(label, str) and label.isdigit():
+        return int(label)
+    return label if isinstance(label, str) else str(label)
+
+
+def load_channel_regions(tiles_dir: str, value_key: str = "calibrated"):
+    """
+    Load every r/g/b OD JSON set of one scan and merge them by film label.
+
+    tiles_dir : the scan's <stem>_tiles folder
+    value_key : 'calibrated' (NIST-calibrated OD) or 'od' (raw scanner OD)
+
+    Returns
+    -------
+    regions : {label: {'r': 1D, 'g': 1D, 'b': 1D, 'rows': 1D|None, 'cols': 1D|None}}
+    records : [{'r': json record, 'g': ..., 'b': ...}, ...]   one per set
+    """
+    regions, records = {}, []
+    for paths in find_od_json_sets(tiles_dir):
+        set_records, set_regions = {}, {}
+        for ch in CHANNELS:
+            record, arrays = load_od_json(paths[ch])
+            record["_json_path"] = os.path.abspath(paths[ch])
+            set_records[ch] = record
+
+            for reg in record["regions"]:
+                vals = reg["values"]
+                entry = set_regions.setdefault(_label_key(reg["label"]), {"rows": None, "cols": None})
+                entry[ch] = arrays[vals[f"{value_key}_key"]]
+                # same mask for every channel, so coordinates from any channel will do
+                if entry["rows"] is None and "rows_key" in vals:
+                    entry["rows"] = arrays[vals["rows_key"]]
+                    entry["cols"] = arrays[vals["cols_key"]]
+
+        for label, entry in set_regions.items():
+            if label in regions:
+                print(f"[WARN] Film {label} appears in more than one label set in {tiles_dir}; "
+                      f"using the first.")
+                continue
+            regions[label] = entry
+        records.append(set_records)
+
+    return regions, records
+
+
+def stack_channels(entry: dict, label, tag: str):
+    """
+    Stack r/g/b pixel arrays into (3, N), keeping only pixels finite in every
+    channel. Returns (X, rows, cols); rows/cols are None if not stored.
+    """
+    arrs = [np.asarray(entry[c], dtype=np.float64).ravel() for c in CHANNELS]
+    rows, cols = entry.get("rows"), entry.get("cols")
+
+    lengths = [a.size for a in arrs]
+    if len(set(lengths)) > 1:
+        raise ValueError(f"{tag} film {label}: channel lengths differ "
+                         f"{dict(zip(CHANNELS, lengths))}; the R, G, B pixels do not line up. "
+                         f"Rerun the read-in for this scan.")
+
+    X = np.stack(arrs, axis=0)
+    keep = np.all(np.isfinite(X), axis=0)
+    n_drop = int((~keep).sum())
+    if n_drop:
+        print(f"[INFO] {tag} film {label}: {n_drop} of {keep.size} pixels NaN in a channel; dropped.")
+
+    if rows is not None and len(rows) == X.shape[1]:
+        return X[:, keep], np.asarray(rows)[keep], np.asarray(cols)[keep]
+    return X[:, keep], None, None
+
+
+def build_unexposed(X_post: np.ndarray, X_pre: np.ndarray, mode: str = "median"):
+    """
+    Unexposed (pre) OD paired with each post pixel.
+
+    'median' : per-channel median of the pre film, used for every post pixel
+    'pixel'  : pixel i of pre with pixel i of post, truncated to the shorter
+               (only meaningful if the two scans are registered)
+    """
+    if mode == "median":
+        base = np.median(X_pre, axis=1, keepdims=True)
+        return X_post, np.broadcast_to(base, X_post.shape).copy()
+    if mode == "pixel":
+        n = min(X_post.shape[1], X_pre.shape[1])
+        return X_post[:, :n], X_pre[:, :n]
+    raise ValueError(f"unexp_mode must be 'median' or 'pixel', got {mode!r}")
+
+
+def _fmt_label(label) -> str:
+    return f"{label:03d}" if isinstance(label, (int, np.integer)) else str(label)
+
+
+# =====================================================================
+# Output
+# =====================================================================
 def save_dose_and_od_to_csv(
     i,
     OD_r, OD_g, OD_b,
@@ -41,208 +156,169 @@ def save_dose_and_od_to_csv(
     D_r=None, D_g=None, D_b=None,
     D_r_err=None, D_g_err=None, D_b_err=None,
     save_dir='',
+    rows=None, cols=None,
 ):
     """
-    Save per-pixel OD values, single-channel doses, and multichannel dose
-    for image pair index i to a CSV file.
-
-    Parameters
-    ----------
-    i                    : int         — image pair index
-    OD_r, OD_g, OD_b    : ndarray (H, W) — OD maps per channel
-    D                    : ndarray (H, W) — multichannel corrected dose
-    D_r, D_g, D_b        : ndarray (H, W) or None — single-channel doses
-    D_r_err, D_g_err, D_b_err : ndarray (H, W) or None — dose uncertainties
-    save_dir             : str         — directory to save CSV files
+    Save per-pixel OD, single-channel doses and multichannel dose for film i.
+    rows/cols = full-resolution scan coordinates of each pixel (if available).
     """
     os.makedirs(save_dir, exist_ok=True)
+    n_pix = np.size(D)
 
-    # Flatten all arrays to 1D
-    H, W   = D.shape
-    n_pix  = H * W
-    pixels = np.arange(n_pix)
-    rows, cols = np.divmod(pixels, W)
+    data = {"index": i, "pixel": np.arange(n_pix)}
+    if rows is not None:
+        data["row"] = np.asarray(rows)
+        data["col"] = np.asarray(cols)
+    data.update({
+        "OD_r": np.ravel(OD_r),
+        "OD_g": np.ravel(OD_g),
+        "OD_b": np.ravel(OD_b),
+        "D_multichannel": np.ravel(D),
+    })
+    for name, arr in (("D_r", D_r), ("D_g", D_g), ("D_b", D_b),
+                      ("D_r_err", D_r_err), ("D_g_err", D_g_err), ("D_b_err", D_b_err)):
+        if arr is not None:
+            data[name] = np.ravel(arr)
 
-    data = {
-        'index':    i,
-        'row':      rows,
-        'col':      cols,
-        'OD_r':     OD_r.ravel(),
-        'OD_g':     OD_g.ravel(),
-        'OD_b':     OD_b.ravel(),
-        'D_multichannel': D.ravel(),
-    }
+    bad = {k: np.size(v) for k, v in data.items() if np.ndim(v) and np.size(v) != n_pix}
+    if bad:
+        raise ValueError(f"Length mismatch (expected {n_pix}): {bad}")
 
-
-    
-
-    if D_r is not None: data['D_r'] = D_r.ravel()
-    if D_g is not None: data['D_g'] = D_g.ravel()
-    if D_b is not None: data['D_b'] = D_b.ravel()
-
-    if D_r_err is not None: data['D_r_err'] = D_r_err.ravel()
-    if D_g_err is not None: data['D_g_err'] = D_g_err.ravel()
-    if D_b_err is not None: data['D_b_err'] = D_b_err.ravel()
-
-    none_keys = [k for k, v in data.items() if v is None]
-    if none_keys:
-        raise ValueError(f"Found None values for keys: {none_keys}")
-    
-    for name, value in data.items():
-        length = len(value) if hasattr(value, '__len__') else 1
-        print(f"{name}: length={length}")
-        if hasattr(value, '__len__') and length != n_pix:
-            print(f"  ⚠️  mismatch — expected {n_pix}")
-
-    df       = pd.DataFrame(data)
-    csv_path = os.path.join(save_dir, f'dose_od_pair_{i:03d}.csv')
-    df.to_csv(csv_path, index=False)
-    print(f"Saved pair {i:03d} → {csv_path}  ({n_pix} pixels)")
+    csv_path = os.path.join(save_dir, f"dose_od_pair_{_fmt_label(i)}.csv")
+    pd.DataFrame(data).to_csv(csv_path, index=False)
+    print(f"Saved film {_fmt_label(i)} → {csv_path}  ({n_pix} pixels)")
     return save_dir
 
 
-def main(postParentDir=None, preParentDir=None, parentDir=None, doseCurveJson='', film_labels=[]):
-    ODs_per_channel_post = {'r': [], 'g': [], 'b': []}
-    ODs_per_channel_pre  = {'r': [], 'g': [], 'b': []}
+def summarize_film_doses(label, OD_r, OD_g, OD_b, D, D_r, D_g, D_b,
+                         D_r_err=None, D_g_err=None, D_b_err=None) -> dict:
+    """One summary row per film: mean/std of OD and dose per channel."""
+    def stats(arr):
+        if arr is None:
+            return np.nan, np.nan
+        a = np.asarray(arr, dtype=float).ravel()
+        a = a[np.isfinite(a)]
+        return (float(a.mean()), float(a.std())) if a.size else (np.nan, np.nan)
 
-    postParentDir, snapshotsPost, preParentDir, snapshotsPre, NISTPost, NISTPre, doseCurveJson, saveDirectory = \
-        constants(postParentDir, preParentDir, parentDir, doseCurveJson)
+    row = {"film": label, "n_pixels": int(np.isfinite(np.asarray(D, float)).sum())}
+    for name, arr in (("OD_r", OD_r), ("OD_g", OD_g), ("OD_b", OD_b), ("D_multi", D),
+                      ("D_r", D_r), ("D_g", D_g), ("D_b", D_b)):
+        row[f"{name}_mean"], row[f"{name}_std"] = stats(arr)
+    for name, arr in (("D_r_err", D_r_err), ("D_g_err", D_g_err), ("D_b_err", D_b_err)):
+        row[f"{name}_mean"] = stats(arr)[0]
+    return row
 
-    def label_for(pos):
-        return film_labels[pos] if pos < len(film_labels) else pos
-    
-    for channel in ['r', 'g', 'b']:
-        for pos, (filePre, filePost) in enumerate(zip(snapshotsPre, snapshotsPost)):
-            label = label_for(pos)
 
-            pre_data  = np.load(NISTPre[channel],  allow_pickle=True)
-            post_data = np.load(NISTPost[channel], allow_pickle=True)
-            P_pre     = pre_data.item()['P']
-            P_post    = post_data.item()['P']
+def save_film_dose_summary(summary_rows, save_dir):
+    if not summary_rows:
+        print("No summary rows to save.")
+        return None
+    os.makedirs(save_dir, exist_ok=True)
+    df = pd.DataFrame(summary_rows)
+    df = df.iloc[df["film"].astype(str).argsort(kind="stable")].reset_index(drop=True)
+    out_path = os.path.join(save_dir, "film_dose_summary.csv")
+    df.to_csv(out_path, index=False)
+    print(f"Saved film dose summary → {out_path}  ({len(df)} films)")
+    return out_path
 
-            preOD, postOD = readInRawODFromPicture(filePre, filePost, channel_map[channel], P_pre, P_post)
-            preOD, postOD = calculate_od(preOD, postOD, P_pre, P_post, channel_map[channel])
 
-            analyzeODs(preOD, postOD, label, channel, saveDirectory)
+def save_provenance(save_dir, records_pre, records_post, doseCurveJson, value_key, unexp_mode):
+    """Which OD JSONs, scans and calibrations produced these doses."""
+    def strip(rec):
+        return {"od_json": rec.get("_json_path"),
+                "source_file": rec.get("source_file"),
+                "calibration": rec.get("calibration")}
 
-            preOD, postOD = match_array_sizes(preOD, postOD)
-            ODs_per_channel_pre[channel].append(preOD)
-            ODs_per_channel_post[channel].append(postOD)
+    prov = {
+        "dose_curve_json": os.path.abspath(doseCurveJson) if doseCurveJson else None,
+        "od_values_used": value_key,
+        "unexposed_mode": unexp_mode,
+        "pre": [{ch: strip(rec[ch]) for ch in CHANNELS} for rec in records_pre],
+        "post": [{ch: strip(rec[ch]) for ch in CHANNELS} for rec in records_post],
+    }
+    out_path = os.path.join(save_dir, "dose_provenance.json")
+    with open(out_path, "w") as f:
+        json.dump(prov, f, indent=2)
+    print(f"Saved provenance → {out_path}")
 
-    found = True
-    n_pairs = len(snapshotsPre)
-    summary_rows = []                      # <-- add before the loop
 
-    for pos in range(n_pairs):
-        label = label_for(pos)
+# =====================================================================
+# Main
+# =====================================================================
+def main(postParentDir=None, preParentDir=None, parentDir=None, doseCurveJson='',
+         film_labels=None, value_key="calibrated", unexp_mode="median"):
+    """
+    value_key  : 'calibrated' (NIST-calibrated OD) or 'od' (raw scanner OD)
+    unexp_mode : 'median' or 'pixel' — how the pre film's OD is paired with the post pixels
+    Returns the results folder.
+    """
+    # pre/postParentDir = each scan's <stem>_tiles folder (from run_clustering)
+    saveDirectory = os.path.join(parentDir, "dose_statistics_results")
+    os.makedirs(saveDirectory, exist_ok=True)
 
-        csv_path = os.path.join(saveDirectory, f'dose_od_pair_{label:03d}.csv')
-        if os.path.exists(csv_path) and found:
-            if ask_yesno("File exists",
-                         f"CSV for pair {label:03d} already exists. "
-                         f"Do you want to continue analyzing dose csvs?",
-                         default_yes=True):
-                break
-            else:
-                found = False
+    pre_regions, records_pre = load_channel_regions(preParentDir, value_key)
+    post_regions, records_post = load_channel_regions(postParentDir, value_key)
 
-        OD_r = ODs_per_channel_post['r'][pos]
-        OD_g = ODs_per_channel_post['g'][pos]
-        OD_b = ODs_per_channel_post['b'][pos]
+    labels = [_label_key(l) for l in film_labels] if film_labels else \
+        sorted(set(pre_regions) & set(post_regions), key=str)
+    missing = [l for l in labels if l not in pre_regions or l not in post_regions]
+    if missing:
+        print(f"[WARN] Skipping films not in both pre and post OD JSONs: {missing}")
+    labels = [l for l in labels if l not in missing]
 
-        Unexp_r = ODs_per_channel_pre['r'][pos]
-        Unexp_g = ODs_per_channel_pre['g'][pos]
-        Unexp_b = ODs_per_channel_pre['b'][pos]
+    overwrite = None
+    summary_rows = []
 
-        X       = np.stack([OD_r, OD_g, OD_b], axis=0)
-        X_unexp = np.stack([Unexp_r, Unexp_g, Unexp_b], axis=0)
+    for label in labels:
+        csv_path = os.path.join(saveDirectory, f"dose_od_pair_{_fmt_label(label)}.csv")
+        if os.path.exists(csv_path):
+            if overwrite is None:
+                overwrite = ask_yesno("Files exist", "Dose CSVs already exist. Overwrite them?",
+                                      default_yes=True)
+            if not overwrite:
+                print(f"[INFO] Skipping film {_fmt_label(label)} (CSV exists)")
+                continue
+
+        X_pre, _, _ = stack_channels(pre_regions[label], label, "pre")
+        X_post, rows, cols = stack_channels(post_regions[label], label, "post")
+        X, X_unexp = build_unexposed(X_post, X_pre, unexp_mode)
+        if rows is not None:
+            rows, cols = rows[:X.shape[1]], cols[:X.shape[1]]
+
+        for k, ch in enumerate(CHANNELS):
+            # the real pre-film distribution, not the single median value used for dose
+            pre_hist = X_unexp[k] if unexp_mode == "pixel" else X_pre[k]
+            BatchHistogram_OD(pre_hist, X[k], label, ch, saveDirectory)
+
+        # X, X_unexp: (3, N) pixel lists; the dose maths works per pixel along axis 0
+        OD_r, OD_g, OD_b = X
 
         D, Delta, alpha, beta, n_iter, cov = dose_calculation(
-            calibration_json=doseCurveJson,
-            X=X,
-            X_unexp=X_unexp,
+            calibration_json=doseCurveJson, X=X, X_unexp=X_unexp,
         )
-        print(f"Pair {label:02d} | multichannel — mean dose: {D.mean():.4f}  "
-              f"std: {D.std():.4f}  iters: {n_iter}")
+        print(f"Film {_fmt_label(label)} | multichannel — mean dose: {np.nanmean(D):.4f}  "
+              f"std: {np.nanstd(D):.4f}  iters: {n_iter}")
 
         D_r, D_r_err = single_channel_dose(OD_r, channel='R', json_path=doseCurveJson)
         D_g, D_g_err = single_channel_dose(OD_g, channel='G', json_path=doseCurveJson)
         D_b, D_b_err = single_channel_dose(OD_b, channel='B', json_path=doseCurveJson)
 
-        save_dir = save_dose_and_od_to_csv(
+        save_dose_and_od_to_csv(
             i=label,
             OD_r=OD_r, OD_g=OD_g, OD_b=OD_b,
             D=D,
             D_r=D_r, D_g=D_g, D_b=D_b,
             D_r_err=D_r_err, D_g_err=D_g_err, D_b_err=D_b_err,
             save_dir=saveDirectory,
+            rows=rows, cols=cols,
         )
-        summary_rows.append(                # <-- add
-            summarize_film_doses(
-                label,
-                OD_r, OD_g, OD_b, D,
-                D_r, D_g, D_b,
-                D_r_err, D_g_err, D_b_err,
-            )
-        )
+        summary_rows.append(summarize_film_doses(label, OD_r, OD_g, OD_b, D, D_r, D_g, D_b,
+                                                 D_r_err, D_g_err, D_b_err))
 
+    save_film_dose_summary(summary_rows, saveDirectory)
+    save_provenance(saveDirectory, records_pre, records_post, doseCurveJson, value_key, unexp_mode)
     return saveDirectory
 
-def summarize_film_doses(label, OD_r, OD_g, OD_b, D,
-                         D_r, D_g, D_b,
-                         D_r_err=None, D_g_err=None, D_b_err=None):
-    """
-    Collapse the per-pixel maps for one film into a single summary row:
-    mean/std OD and dose per channel, plus mean uncertainty per channel.
-    Returns a dict (one row).
-    """
-    def stats(arr):
-        if arr is None:
-            return np.nan, np.nan
-        a = np.asarray(arr, dtype=float).ravel()
-        a = a[np.isfinite(a)]
-        if a.size == 0:
-            return np.nan, np.nan
-        return float(a.mean()), float(a.std())
 
-    OD_r_mean, OD_r_std = stats(OD_r)
-    OD_g_mean, OD_g_std = stats(OD_g)
-    OD_b_mean, OD_b_std = stats(OD_b)
-
-    D_multi_mean, D_multi_std = stats(D)
-    D_r_mean, D_r_std = stats(D_r)
-    D_g_mean, D_g_std = stats(D_g)
-    D_b_mean, D_b_std = stats(D_b)
-
-    # mean of the per-pixel uncertainty maps (if provided)
-    D_r_err_mean, _ = stats(D_r_err)
-    D_g_err_mean, _ = stats(D_g_err)
-    D_b_err_mean, _ = stats(D_b_err)
-
-    n_pix = int(np.isfinite(np.asarray(D, dtype=float).ravel()).sum())
-
-    return {
-        'film':            label,
-        'n_pixels':        n_pix,
-        'OD_r_mean':       OD_r_mean,  'OD_r_std': OD_r_std,
-        'OD_g_mean':       OD_g_mean,  'OD_g_std': OD_g_std,
-        'OD_b_mean':       OD_b_mean,  'OD_b_std': OD_b_std,
-        'D_multi_mean':    D_multi_mean, 'D_multi_std': D_multi_std,
-        'D_r_mean':        D_r_mean,   'D_r_std':  D_r_std,   'D_r_err_mean': D_r_err_mean,
-        'D_g_mean':        D_g_mean,   'D_g_std':  D_g_std,   'D_g_err_mean': D_g_err_mean,
-        'D_b_mean':        D_b_mean,   'D_b_std':  D_b_std,   'D_b_err_mean': D_b_err_mean,
-    }
-
-
-def save_film_dose_summary(summary_rows, save_dir):
-    """Write the accumulated per-film summary rows to one CSV."""
-    if not summary_rows:
-        print("No summary rows to save.")
-        return None
-    os.makedirs(save_dir, exist_ok=True)
-    df = pd.DataFrame(summary_rows).sort_values('film').reset_index(drop=True)
-    out_path = os.path.join(save_dir, 'film_dose_summary.csv')
-    df.to_csv('/home/michaelgajda/cal_Lab_Work/film/film_triple_channel_dosimetry/ebtxD_lot/film_dose_summary.csv', index=False)
-    print(f"Saved film dose summary → {out_path}  ({len(df)} films)")
-    return out_path
-
+if __name__ == "__main__":
+    main()

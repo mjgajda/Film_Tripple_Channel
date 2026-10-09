@@ -120,7 +120,7 @@ def plot_all_film_histograms(csv_dir, film_types=None, channels=None,
                              n_bins=100, output_dir=None,
                              x_min=None, x_max=None, film_label=None):
     csv_files = sorted(
-        Path(csv_dir).glob('*.csv'),
+        Path(csv_dir).glob('dose_od_pair_*.csv'),   # not the summary CSV
         key=lambda f: extract_film_number(f)
     )
 

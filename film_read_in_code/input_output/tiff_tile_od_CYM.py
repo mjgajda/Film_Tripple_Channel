@@ -5,9 +5,28 @@ from film_read_in_code.utils.helpers import scanner_to_OD
 from pathlib import Path
 
 
-def extract_channel(tile_bgr: np.ndarray, channel: str) -> np.ndarray:
-    ch = channel.lower()
+VALID_CHANNELS = {"r", "g", "b", "c", "m", "y", "k"}
+
+
+def extract_channel(tile_bgr: np.ndarray, channel) -> np.ndarray:
+    """
+    One channel of a cv2 (BGR) tile as float64 in scanner units.
+
+    channel : int index (0=B, 1=G, 2=R), 'r'/'g'/'b' (direct index), or
+              'c'/'m'/'y'/'k' (derived from RGB, rescaled to scanner units).
+    Grayscale (2D) tiles are returned as-is.
+    """
     scale = 65535.0 if tile_bgr.dtype == np.uint16 else 255.0
+
+    if tile_bgr.ndim == 2:
+        return np.clip(tile_bgr, 0, scale).astype(np.float64)
+
+    if isinstance(channel, (int, np.integer)):
+        return np.clip(tile_bgr[..., int(channel)], 0, scale).astype(np.float64)
+
+    ch = channel.lower()
+    if ch not in VALID_CHANNELS:
+        raise ValueError(f"channel must be 0-2 or one of {VALID_CHANNELS}, got {channel!r}")
 
     if ch in ("r", "g", "b"):
         idx = {"b": 0, "g": 1, "r": 2}[ch]
@@ -40,17 +59,25 @@ def compute_mask_od_from_tiff_tile(
     tile_id: str = "tile0",
     margin_factor: float = 1.2,
     temp_dir: str | None = None,
-) -> np.ndarray:
+    return_coords: bool = False,
+):
     """
     cv2-only version of TIFF tile extraction.
 
     - Saves tile as full-color if the input TIFF is color.
     - Uses only the specified channel for OD computation.
-    channel: one of 'r', 'g', 'b', 'c', 'm', 'y', 'k' (case-insensitive)
+    - Pixels with scanner value <= 0 become NaN instead of being dropped, so the
+      R, G and B arrays for one mask stay the same length and pixel-aligned.
+    channel: one of 'r', 'g', 'b', 'c', 'm', 'y', 'k' (case-insensitive) or 0-2
+
+    Returns
+    -------
+    od                    when return_coords is False
+    (od, rows, cols)      when return_coords is True; rows/cols are the
+                          full-resolution scan coordinates of each OD value
     """
-    VALID = {"r", "g", "b", "c", "m", "y", "k"}
-    if channel.lower() not in VALID:
-        raise ValueError(f"channel must be one of {VALID}, got {channel!r}")
+    if not isinstance(channel, (int, np.integer)) and channel.lower() not in VALID_CHANNELS:
+        raise ValueError(f"channel must be one of {VALID_CHANNELS}, got {channel!r}")
 
     # ----------------------------------------
     # 1) Build square bbox in scaled space
@@ -82,8 +109,8 @@ def compute_mask_od_from_tiff_tile(
 
         return y0, y1, x0, x1
 
-    Hs, Ws = scaled_shape
-    Hf, Wf = full_shape
+    Hs, Ws = scaled_shape[:2]
+    Hf, Wf = full_shape[:2]
 
     y0s, y1s, x0s, x1s = square_bbox_around_mask(
         mask_scaled, margin_factor_local=margin_factor
@@ -130,13 +157,10 @@ def compute_mask_od_from_tiff_tile(
         temp_dir = path
 
     # Join the path with the new folder name
-    save_folder = os.path.join(temp_dir, f"{file[:-4]}_tiles")
-
-    if not os.path.exists(save_folder):
-        os.makedirs(save_folder)
-
-    print(f"Files will be saved to: {save_folder}")
     base = os.path.splitext(os.path.basename(file))[0]
+    save_folder = os.path.join(temp_dir, f"{base}_tiles")
+    os.makedirs(save_folder, exist_ok=True)
+
     out_tile_name = f"{base}_{tile_id}.tif"
     out_tile_path = os.path.join(save_folder, out_tile_name)
 
@@ -147,15 +171,7 @@ def compute_mask_od_from_tiff_tile(
     # ----------------------------------------
     # 5) Prepare data for OD (use in-memory tile_full, no need to reload)
     # ----------------------------------------
-    if tile_full.ndim == 2:
-        selected = tile_full.astype(np.float64)
-    elif channel.lower() in ("c", "m", "y", "k"):
-        # CMYK channels require conversion via extract_channel
-        selected = extract_channel(tile_full, channel)
-    else:
-        # R, G, B — use original direct index
-        idx = {"b": 0, "g": 1, "r": 2}[channel.lower()]
-        selected = tile_full[..., idx].astype(np.float64)
+    selected = extract_channel(tile_full, channel)
 
     Ht, Wt = selected.shape
 
@@ -166,14 +182,17 @@ def compute_mask_od_from_tiff_tile(
         interpolation=cv2.INTER_NEAREST,
     ).astype(bool)
 
-    vals = selected[mask_crop_full]
-    vals = vals[vals > 0]
-
-    if vals.size == 0:
-        return np.zeros(1)
+    rr, cc = np.nonzero(mask_crop_full)          # same order as selected[mask_crop_full]
+    vals = selected[rr, cc]
 
     # ----------------------------------------
-    # 6) Compute OD
+    # 6) Compute OD (scanner value <= 0 -> NaN, kept in place)
     # ----------------------------------------
-    od = scanner_to_OD(vals)
+    od = np.full(vals.shape, np.nan)
+    good = vals > 0
+    if good.any():
+        od[good] = scanner_to_OD(vals[good])
+
+    if return_coords:
+        return od, rr + fy0, cc + fx0            # full-res image coordinates
     return od
