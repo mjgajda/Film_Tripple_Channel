@@ -25,7 +25,7 @@ def checkForSaveDirectory(sub_folder_name="Profiles", saveDirectory="./Saves"):
 def plot_2d_profile(profile, index, directory, label, measurement_type="OD"):
     plt.figure(figsize=(6,5))
     im = plt.imshow(profile, cmap="inferno")
-    plt.title(f"2D Dose Profile {label} {index + 1} ({measurement_type})")
+    plt.title(f"2D Dose Profile {label} {index} ({measurement_type})")
     plt.colorbar(im, label=measurement_type)
     plt.axis('off')
     plt.tight_layout()
@@ -35,7 +35,7 @@ def plot_2d_profile(profile, index, directory, label, measurement_type="OD"):
 def plot_2d_profile_difference(profile_diff, index, directory, label):
     plt.figure(figsize=(6,5))
     im = plt.imshow(profile_diff, cmap="inferno", vmax=1.1, vmin=-.1)
-    plt.title(f"2D Dose Profile Difference {index + 1} (Post - Pre)")
+    plt.title(f"2D Dose Profile Difference {index} (Post - Pre)")
     plt.colorbar(im, label='OD Difference')
     plt.axis('off')
     plt.tight_layout()
@@ -58,8 +58,8 @@ def Batch2Dprofile_OD(OD_pre, OD_post, index,channel,saveDirectory):
         profile_data.append(od_diff)
 
         # Plot all 3 maps
-        plot_2d_profile(od_maps[0], index,  directory, label=f"Pre_{index + 1}_{channel}")
-        plot_2d_profile(od_maps[1], index, directory, label=f"Post_{index + 1}_{channel}")
+        plot_2d_profile(od_maps[0], index,  directory, label=f"Pre_{index}_{channel}")
+        plot_2d_profile(od_maps[1], index, directory, label=f"Post_{index}_{channel}")
         plot_2d_profile(od_diff,     index, directory, label=f"Difference_{index + 1}_{channel}")
 
     do_one_rectangle(0)

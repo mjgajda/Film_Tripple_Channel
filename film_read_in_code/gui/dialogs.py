@@ -1,7 +1,7 @@
 # gui/dialogs.py
 from tkinter import Tk, simpledialog, filedialog
 import os
-
+from Constants import Directory
 def ask_text(title: str, prompt: str, default: str = "") -> str:
     root = Tk(); root.withdraw()
     val = simpledialog.askstring(title, prompt, initialvalue=default)
@@ -21,7 +21,7 @@ def ask_yesno(title: str, prompt: str, default_yes: bool = True) -> bool:
 
 def ask_open_file(title: str = "Select image file") -> tuple[str, str]:
     root = Tk(); root.withdraw()
-    fpath = filedialog.askopenfilename(title=title)
+    fpath = filedialog.askopenfilename(title=title, initialdir=Directory)
     root.destroy()
     if not fpath:
         raise KeyboardInterrupt("User cancelled file selection.")

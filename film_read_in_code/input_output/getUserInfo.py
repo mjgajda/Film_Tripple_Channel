@@ -2,7 +2,7 @@ from film_read_in_code.gui.dialogs import ask_text, ask_yesno, ask_open_file
 import numpy as np
 def getFile():
     try:
-        file, path = ask_open_file("Select an image file")
+        file, path = ask_open_file("Select an image file", )
         if not file or not path:
             raise ValueError("No file selected.")
         return file, path
@@ -20,16 +20,6 @@ def get_user_inputs():
             break
         except ValueError as e:
             print(f"[ERROR] Invalid max_mb input: {e}. Please try again.")
-
-    # Number of clusters
-    while True:
-        try:
-            n_clusters = int(ask_text("Clustering", "How many films are being analyzed?", "7"))
-            if n_clusters <= 0:
-                raise ValueError("Must be a positive integer.")
-            break
-        except ValueError as e:
-            print(f"[ERROR] Invalid n_clusters input: {e}. Please try again.")
 
     nist_clusters = 7
 
@@ -74,4 +64,4 @@ def get_user_inputs():
         except ValueError as e:
             print(f"[ERROR] Invalid od_thresh_factor input: {e}. Please try again.")
 
-    return  max_mb, n_clusters, nist_clusters, top_n, n_background, od_thresh_factor, refODs
+    return  max_mb, nist_clusters, top_n, n_background, od_thresh_factor, refODs

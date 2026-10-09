@@ -6,14 +6,15 @@ import numpy as np
 from film_read_in_code.make_masks_high_res import Load_Image_and_Run_Clustering
 import os
 # from clustering.save_images import save_cropped_rois
-from film_read_in_code.Get_analysis_areas import get_analysis_areas
+from film_read_in_code.Get_analysis_areas import get_analysis_areas, get_nist_analysis_areas
 from film_read_in_code.input_output.getUserInfo import get_user_inputs, getFile
 
 channel_map = {'r': 2, 'g': 1, 'b':0}
 channel_map_inv = {v: k for k, v in channel_map.items()}
 
 
-def load_or_run_clustering(role: str, load_fn, film_labels):
+    
+def load_or_run_clustering(role: str, load_fn, film_labels,multiLabels=False):
     """
     Checks if the stats dictionary already exists for this role ('pre' or 'post').
     If yes → load it from disk.
@@ -50,21 +51,34 @@ def load_or_run_clustering(role: str, load_fn, film_labels):
         if ask_yesno("Load Cached Stats?", f"Saved {role} stats found for this file. Do you want to load them?", True):
             return STATS_DIR, path
 
-    max_mb, n_clusters, nist_clusters, top_n, n_background, od_thresh_factor, refODs = \
+    max_mb, nist_clusters, top_n, n_background, od_thresh_factor, refODs = \
         get_user_inputs()
+    
+    nist_info = get_nist_analysis_areas(file, path, 2, max_mb, nist_clusters, top_n, n_background, od_thresh_factor)
+
+
     
 
     # Otherwise run clustering
-    print(f"[INFO] No cached {role} stats found. Running clustering...")
+    if multiLabels:
+        for labels in film_labels:
+            n_cluster = len(labels)
+            film_info = get_analysis_areas(file, path, 2, max_mb, n_cluster,  n_background, od_thresh_factor)
+            for chan in [2,1,0]: # loop through all channels to save stats for each
+                stats = Load_Image_and_Run_Clustering(file, path, channel_map_inv[chan], nist_info, film_info, refODs, labels)
+                save_stats_dict(stats, stem, color=channel_map_inv[chan], STATS_DIR=STATS_DIR)
+            print(f"[INFO] Saved new {role} stats to:", stats_path)
+        print(f"[INFO] No cached {role} stats found. Running clustering...")
+    else:
+        n_clusters = len(film_labels)
+        film_info = get_analysis_areas(file, path, 2, max_mb, n_clusters,  n_background, od_thresh_factor)
 
-    info = get_analysis_areas(file, path, 2, max_mb, n_clusters, nist_clusters, top_n, n_background, od_thresh_factor)
+        for chan in [2,1,0]: # loop through all channels to save stats for each
+            stats = Load_Image_and_Run_Clustering(file, path, channel_map_inv[chan], nist_info, film_info, refODs, film_labels)
 
-    for chan in [2,1,0]: # loop through all channels to save stats for each
-        stats = Load_Image_and_Run_Clustering(file, path, channel_map_inv[chan], info, refODs, film_labels)
-
-    # Save result
-        save_stats_dict(stats, stem, color=channel_map_inv[chan], STATS_DIR=STATS_DIR)
-        print(f"[INFO] Saved new {role} stats to:", stats_path)
+        # Save result
+            save_stats_dict(stats, stem, color=channel_map_inv[chan], STATS_DIR=STATS_DIR)
+            print(f"[INFO] Saved new {role} stats to:", stats_path)
 
     return  STATS_DIR, path
 
@@ -97,14 +111,15 @@ def save_stats_dict(stats: dict, role: str, color: str, STATS_DIR: str = "stats"
         print(f"[INFO] Stats file already exists, not overwriting: {out_path}")
         return
 
-    np.save(out_path, stats, allow_pickle=True)
+    np.save(out_path, stats, allow_pickle=True) # type: ignore
     print(f"[INFO] Saved {role} stats to: {out_path}")
 
 
-def run_clustering(film_labels):
-    path_pre, parent_path = load_or_run_clustering("pre", Load_Image_and_Run_Clustering, film_labels)
+def run_clustering(film_labels, multiLabels=False):
+    path_pre, parent_path = load_or_run_clustering("pre", Load_Image_and_Run_Clustering, film_labels,multiLabels=multiLabels)
 
-    path_post, parent_path = load_or_run_clustering("post", Load_Image_and_Run_Clustering, film_labels)
+    path_post, parent_path = load_or_run_clustering("post", Load_Image_and_Run_Clustering, film_labels, multiLabels=multiLabels)
+
 
     return path_pre, parent_path, path_post, parent_path
 

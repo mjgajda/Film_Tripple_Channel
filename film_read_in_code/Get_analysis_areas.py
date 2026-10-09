@@ -112,9 +112,7 @@ def cluster_cut_once(scaled_img_cut, n_background, od_thresh_factor, n_clusters)
     masks_fils, labels_c = sort_and_relabel_masks_by_median(masks_fils)
     return masks_fils, labels_c
 
-def get_analysis_areas(file, path, channel, max_mb, n_clusters, nist_clusters, top_n, n_background, od_thresh_factor):
-    
-
+def get_nist_analysis_areas(file, path, channel, max_mb, nist_clusters, top_n, n_background, od_thresh_factor): 
     while True:
         scaled_img_nist, red_mask_scaled, (x, y, w, h), upper_limit, scale_x, scale_y, full_shape = load_and_select_region(path, file, channel, max_mb)
 
@@ -139,9 +137,11 @@ def get_analysis_areas(file, path, channel, max_mb, n_clusters, nist_clusters, t
         mm = np.zeros_like(scaled_img_nist, dtype=bool)
         mm[y:y+h, x:x+w] = m
         nist_masks_scaled.append(mm)
-    # Vertical cut image (everything below the NIST region + margin)
     
+    return nist_masks_scaled, scaled_img_nist, full_shape
 
+def get_analysis_areas(file, path, channel, max_mb, n_clusters,  n_background, od_thresh_factor):
+    
     while True:
         scaled_img_film, red_mask_scaled, (x, y, w, h), upper_limit, scale_x, scale_y, full_shape = load_and_select_region(path, file, channel, max_mb)
         cut_img = scaled_img_film[y:y+h, x:x+w]
@@ -152,7 +152,8 @@ def get_analysis_areas(file, path, channel, max_mb, n_clusters, nist_clusters, t
             break
 
     # Shrink vertical-cut masks
-    masks_fils = shrink_masks_to_median_window(masks_fils, fraction=.5)
+    from Constants import roiFraction
+    masks_fils = shrink_masks_to_median_window(masks_fils, fraction=roiFraction)
 
     # Embed vertical-cut masks back into full scaled image
     cut_masks_scaled = []
@@ -161,5 +162,5 @@ def get_analysis_areas(file, path, channel, max_mb, n_clusters, nist_clusters, t
         mm[y:y+h, x:x+w] = m
         cut_masks_scaled.append(mm)
     
-
+    return cut_masks_scaled, scaled_img_film, full_shape, scale_x, scale_y
     return nist_masks_scaled, cut_masks_scaled, scaled_img_film, scaled_img_nist, full_shape, scale_x, scale_y

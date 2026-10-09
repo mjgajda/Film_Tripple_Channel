@@ -30,13 +30,13 @@ def NISTfilter_cal(masks, scan, refODs: np.ndarray):
 
     # --- Plot calibration ---
     xs = np.linspace(refOD_vals.min(), refOD_vals.max(), 200)
-    plt.plot(xs, np.polyval(P, xs), '--', label=f'Fit (R² = {r_squared:.4f})')
-    plt.plot(refOD_vals, refODs, 'o', label='Measured')
-    plt.xlabel('Scanner-Measured OD')
-    plt.ylabel('Reference OD')
-    plt.legend()
-    plt.title('NIST Calibration Fit')
-    plt.grid(True)
-    plt.show()
+    # plt.plot(xs, np.polyval(P, xs), '--', label=f'Fit (R² = {r_squared:.4f})')
+    # plt.plot(refOD_vals, refODs, 'o', label='Measured')
+    # plt.xlabel('Scanner-Measured OD')
+    # plt.ylabel('Reference OD')
+    # plt.legend()
+    # plt.title('NIST Calibration Fit')
+    # plt.grid(True)
+    # plt.show()
 
     return P, S, refOD_us

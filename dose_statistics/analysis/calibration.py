@@ -28,11 +28,11 @@ def NISTfilter_cal(file, path, refODs: np.ndarray, colorSpectrum: int):
     P, S = polyfit_linear(refOD_vals, refODs)
 
     xs = np.linspace(refOD_vals.min(), refOD_vals.max(), 200)
-    plt.plot(xs, np.polyval(P, xs), '--', label='Fit')
-    plt.plot(refOD_vals, refODs, 'o', label='Measured')
-    plt.xlabel('Scanner-Measured OD'); plt.ylabel('Reference OD')
-    plt.legend(); plt.title('NIST calibration fit')
-    plt.show()
+    # plt.plot(xs, np.polyval(P, xs), '--', label='Fit')
+    # plt.plot(refOD_vals, refODs, 'o', label='Measured')
+    # plt.xlabel('Scanner-Measured OD'); plt.ylabel('Reference OD')
+    # plt.legend(); plt.title('NIST calibration fit')
+    # plt.show()
 
    
 

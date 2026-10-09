@@ -54,7 +54,7 @@ def test_cluster_labels_visual(
     ax.imshow(scaled_img, cmap="gray")
 
     n_masks = len(masks)
-    cmap = cm.get_cmap("tab20", n_masks)
+    cmap = plt.get_cmap("tab20", n_masks)
     colors = [cmap(i) for i in range(n_masks)]
     cmap_list = mcolors.ListedColormap(colors)
 
